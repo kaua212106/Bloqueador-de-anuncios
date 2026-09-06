@@ -4,7 +4,6 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
-import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
@@ -44,22 +43,39 @@ public class AdBlockVpnService extends VpnService {
     private SharedPreferences prefs;
     private volatile Set<String> externalList = Collections.emptySet();
 
+    // Redes de anúncios mais comuns em apps Android. Evitamos raízes muito amplas que
+    // poderiam quebrar serviços legítimos do mesmo provedor.
     private static final Set<String> BUILTIN_ADS = new HashSet<>(Arrays.asList(
         "doubleclick.net", "googleadservices.com", "googlesyndication.com", "googletagservices.com",
-        "adservice.google.com", "adnxs.com", "adsrvr.org", "advertising.com", "taboola.com",
-        "outbrain.com", "criteo.com", "criteo.net", "pubmatic.com", "rubiconproject.com",
-        "openx.net", "smartadserver.com", "amazon-adsystem.com", "moatads.com", "adsafeprotected.com",
-        "casalemedia.com", "lijit.com", "yieldmo.com", "media.net", "adform.net", "adform.com",
-        "adcolony.com", "unityads.unity3d.com", "applovin.com", "applvn.com", "chartboost.com",
-        "vungle.com", "inmobi.com", "startappservice.com", "tapjoy.com", "fyber.com", "smaato.net",
-        "mopub.com", "adzerk.net", "quantserve.com", "exoclick.com", "propellerads.com"
+        "adservice.google.com", "admob.com", "adnxs.com", "adsrvr.org", "advertising.com",
+        "taboola.com", "outbrain.com", "criteo.com", "criteo.net", "pubmatic.com",
+        "rubiconproject.com", "openx.net", "smartadserver.com", "amazon-adsystem.com",
+        "moatads.com", "adsafeprotected.com", "casalemedia.com", "lijit.com", "yieldmo.com",
+        "media.net", "adform.net", "adform.com", "adcolony.com", "applovin.com", "applvn.com",
+        "chartboost.com", "vungle.com", "vungle.io", "vunglecloud.com", "inmobi.com", "inmobi.net",
+        "startappservice.com", "start.io", "tapjoy.com", "fyber.com", "smaato.net", "smaato.com",
+        "mopub.com", "adzerk.net", "quantserve.com", "exoclick.com", "propellerads.com",
+        "supersonicads.com", "ironsrc.com", "unityads.unity3d.com", "inner-active.mobi",
+        "pangleglobal.com", "pangle.io", "mintegral.com", "mtgglobals.com", "mbridge.com",
+        "pubnative.net", "ogury.com", "ogury.io", "liftoff.io", "moloco.com", "moloco.cloud",
+        "yandexadexchange.net", "indexww.com", "indexexchange.com", "triplelift.com", "teads.tv",
+        "yieldlab.net", "adition.com", "adscale.de", "adscale.com", "bidswitch.net",
+        "contextweb.com", "spotxchange.com", "spotx.tv", "improvedigital.com", "sharethrough.com"
     ));
 
     private static final Set<String> BUILTIN_TRACKERS = new HashSet<>(Arrays.asList(
         "google-analytics.com", "analytics.google.com", "app-measurement.com", "googletagmanager.com",
         "scorecardresearch.com", "hotjar.com", "fullstory.com", "mouseflow.com", "clarity.ms",
         "api.segment.io", "cdn.segment.com", "mixpanel.com", "amplitude.com", "newrelic.com",
-        "newrelic.com", "nr-data.net", "mathtag.com", "demdex.net", "2o7.net", "omtrdc.net"
+        "nr-data.net", "mathtag.com", "demdex.net", "2o7.net", "omtrdc.net", "appsflyer.com",
+        "appsflyersdk.com", "adjust.com", "adjust.io", "kochava.com", "kochava.io"
+    ));
+
+    // Quando ativado, dificulta que navegadores/apps ignorem o DNS local usando DoH por hostname.
+    // Não cobre clientes que usem IP fixo ou que transportem o anúncio no mesmo domínio do conteúdo.
+    private static final Set<String> SECURE_DNS_HOSTS = new HashSet<>(Arrays.asList(
+        "dns.google", "cloudflare-dns.com", "dns.quad9.net", "doh.opendns.com",
+        "dns.nextdns.io", "dns.adguard-dns.com", "doh.cleanbrowsing.org", "dns0.eu"
     ));
 
     @Override
@@ -143,7 +159,7 @@ public class AdBlockVpnService extends VpnService {
 
             running = true;
             prefs.edit().putBoolean("running", true).apply();
-            worker = new Thread(this::runLoop, "adblock-vpn");
+            worker = new Thread(this::runLoop, "adblock-vpn-v2");
             worker.start();
         } catch (Exception e) {
             running = false;
@@ -180,7 +196,7 @@ public class AdBlockVpnService extends VpnService {
             int ihl = (packet[0] & 0x0F) * 4;
             if (ihl < 20 || length < ihl + 8) return null;
             int protocol = packet[9] & 0xFF;
-            if (protocol != 17) return null; // UDP only in V1
+            if (protocol != 17) return null; // consultas UDP/53 nesta implementação
 
             int srcPort = u16(packet, ihl);
             int dstPort = u16(packet, ihl + 2);
@@ -201,6 +217,13 @@ public class AdBlockVpnService extends VpnService {
             } else {
                 dnsResponse = forwardDns(dnsQuery);
                 if (dnsResponse == null) return null;
+
+                // V2: bloqueia também quando um domínio permitido apenas redireciona por CNAME/SVCB
+                // para uma rede que consta nos filtros (CNAME cloaking).
+                if (responsePointsToBlockedTarget(dnsResponse)) {
+                    dnsResponse = nxdomain(dnsQuery);
+                    incrementStats(domain);
+                }
             }
             return buildIpv4UdpResponse(packet, ihl, srcPort, dnsResponse);
         } catch (Exception e) {
@@ -217,7 +240,8 @@ public class AdBlockVpnService extends VpnService {
         if (matchesAny(domain, custom)) return true;
         if (matchesAny(domain, BUILTIN_ADS)) return true;
         if (matchesAny(domain, externalList)) return true;
-        return prefs.getBoolean("trackers", true) && matchesAny(domain, BUILTIN_TRACKERS);
+        if (prefs.getBoolean("trackers", true) && matchesAny(domain, BUILTIN_TRACKERS)) return true;
+        return prefs.getBoolean("block_secure_dns", true) && matchesAny(domain, SECURE_DNS_HOSTS);
     }
 
     private boolean matchesAny(String domain, Set<String> set) {
@@ -233,17 +257,8 @@ public class AdBlockVpnService extends VpnService {
 
     private String parseDomain(byte[] dns) {
         if (dns.length < 13 || u16(dns, 4) < 1) return null;
-        int p = 12;
-        StringBuilder b = new StringBuilder();
-        int guard = 0;
-        while (p < dns.length && guard++ < 128) {
-            int len = dns[p++] & 0xFF;
-            if (len == 0) break;
-            if ((len & 0xC0) != 0 || len > 63 || p + len > dns.length) return null;
-            if (b.length() > 0) b.append('.');
-            for (int i = 0; i < len; i++) b.append((char)(dns[p++] & 0xFF));
-        }
-        return b.toString().toLowerCase(Locale.ROOT);
+        NameRead nr = readDnsName(dns, 12);
+        return nr == null ? null : nr.name.toLowerCase(Locale.ROOT);
     }
 
     private byte[] nxdomain(byte[] query) {
@@ -253,6 +268,7 @@ public class AdBlockVpnService extends VpnService {
         r[3] = (byte)0x83; // RA + NXDOMAIN
         r[6] = r[7] = 0; // answers
         r[8] = r[9] = 0; // authority
+        r[10] = r[11] = 0; // additional
         return r;
     }
 
@@ -263,13 +279,100 @@ public class AdBlockVpnService extends VpnService {
             socket.setSoTimeout(3500);
             DatagramPacket q = new DatagramPacket(query, query.length, InetAddress.getByName(upstream), 53);
             socket.send(q);
-            byte[] buf = new byte[4096];
+            byte[] buf = new byte[8192];
             DatagramPacket r = new DatagramPacket(buf, buf.length);
             socket.receive(r);
             return Arrays.copyOf(r.getData(), r.getLength());
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private boolean responsePointsToBlockedTarget(byte[] dns) {
+        try {
+            if (dns == null || dns.length < 12) return false;
+            int qd = u16(dns, 4);
+            int an = u16(dns, 6);
+            int p = 12;
+
+            for (int i = 0; i < qd; i++) {
+                NameRead qname = readDnsName(dns, p);
+                if (qname == null || qname.nextOffset + 4 > dns.length) return false;
+                p = qname.nextOffset + 4;
+            }
+
+            for (int i = 0; i < an; i++) {
+                NameRead owner = readDnsName(dns, p);
+                if (owner == null) return false;
+                p = owner.nextOffset;
+                if (p + 10 > dns.length) return false;
+
+                int type = u16(dns, p);
+                int rdlen = u16(dns, p + 8);
+                int rdata = p + 10;
+                int next = rdata + rdlen;
+                if (next > dns.length) return false;
+
+                if (type == 5) { // CNAME
+                    NameRead target = readDnsName(dns, rdata);
+                    if (target != null && !target.name.isEmpty() && shouldBlock(target.name)) return true;
+                } else if ((type == 64 || type == 65) && rdlen > 2) { // SVCB / HTTPS
+                    NameRead target = readDnsName(dns, rdata + 2);
+                    if (target != null && !target.name.isEmpty() && !".".equals(target.name) && shouldBlock(target.name)) return true;
+                }
+                p = next;
+            }
+        } catch (Exception ignored) { }
+        return false;
+    }
+
+    private static class NameRead {
+        final String name;
+        final int nextOffset;
+        NameRead(String name, int nextOffset) {
+            this.name = name;
+            this.nextOffset = nextOffset;
+        }
+    }
+
+    private NameRead readDnsName(byte[] dns, int offset) {
+        if (dns == null || offset < 0 || offset >= dns.length) return null;
+        StringBuilder name = new StringBuilder();
+        int p = offset;
+        int next = -1;
+        int jumps = 0;
+        int labels = 0;
+
+        while (p < dns.length && jumps < 32 && labels < 128) {
+            int len = dns[p] & 0xFF;
+            if (len == 0) {
+                if (next < 0) next = p + 1;
+                break;
+            }
+
+            if ((len & 0xC0) == 0xC0) {
+                if (p + 1 >= dns.length) return null;
+                int pointer = ((len & 0x3F) << 8) | (dns[p + 1] & 0xFF);
+                if (pointer < 0 || pointer >= dns.length) return null;
+                if (next < 0) next = p + 2;
+                p = pointer;
+                jumps++;
+                continue;
+            }
+
+            if ((len & 0xC0) != 0 || len > 63 || p + 1 + len > dns.length) return null;
+            p++;
+            if (name.length() > 0) name.append('.');
+            for (int i = 0; i < len; i++) {
+                int c = dns[p++] & 0xFF;
+                if (c >= 'A' && c <= 'Z') c += 32;
+                name.append((char)c);
+            }
+            labels++;
+        }
+
+        if (next < 0) return null;
+        return new NameRead(name.toString(), next);
     }
 
     private byte[] buildIpv4UdpResponse(byte[] original, int originalIhl, int originalSrcPort, byte[] dns) {
@@ -289,7 +392,7 @@ public class AdBlockVpnService extends VpnService {
         put16(out, 20, 53);
         put16(out, 22, originalSrcPort);
         put16(out, 24, 8 + dns.length);
-        out[26] = out[27] = 0; // UDP checksum optional for IPv4
+        out[26] = out[27] = 0; // UDP checksum opcional em IPv4
         System.arraycopy(dns, 0, out, 28, dns.length);
 
         int checksum = ipChecksum(out, 0, 20);
@@ -362,7 +465,7 @@ public class AdBlockVpnService extends VpnService {
             externalList = Collections.emptySet();
             return;
         }
-        HashSet<String> set = new HashSet<>(90000);
+        HashSet<String> set = new HashSet<>(120000);
         try (BufferedReader br = new BufferedReader(new FileReader(file))) {
             String line;
             while ((line = br.readLine()) != null) {

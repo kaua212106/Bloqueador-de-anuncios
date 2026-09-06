@@ -10,6 +10,8 @@ import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.graphics.Color;
+import android.view.WindowInsets;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -27,10 +29,8 @@ import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
@@ -38,10 +38,17 @@ public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 1001;
     private static final int NOTIFICATION_REQUEST = 1002;
     private static final String PREFS = "adblock_prefs";
-    private static final String LIST_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts";
+    private static final long AUTO_UPDATE_INTERVAL_MS = 7L * 24L * 60L * 60L * 1000L;
+
+    // Duas fontes em formato hosts. Se uma falhar, a outra ainda pode atualizar a proteção.
+    private static final String[] LIST_URLS = new String[]{
+        "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+        "https://adaway.org/hosts.txt"
+    };
 
     private WebView webView;
     private SharedPreferences prefs;
+    private volatile boolean listDownloadRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,8 +59,16 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         if (!prefs.contains("trackers")) prefs.edit().putBoolean("trackers", true).apply();
         if (!prefs.contains("dns")) prefs.edit().putString("dns", "1.1.1.1").apply();
+        if (!prefs.contains("block_secure_dns")) prefs.edit().putBoolean("block_secure_dns", true).apply();
 
         webView = new WebView(this);
+        webView.setBackgroundColor(Color.rgb(102, 126, 234));
+        if (Build.VERSION.SDK_INT >= 21) {
+            webView.setOnApplyWindowInsetsListener((v, insets) -> {
+                v.setPadding(0, insets.getSystemWindowInsetTop(), 0, 0);
+                return insets;
+            });
+        }
         setContentView(webView);
 
         WebSettings s = webView.getSettings();
@@ -68,6 +83,8 @@ public class MainActivity extends Activity {
         webView.setWebChromeClient(new WebChromeClient());
         webView.addJavascriptInterface(new Bridge(this), "AdBlock");
         webView.loadUrl("file:///android_asset/index.html");
+
+        maybeAutoUpdateList();
     }
 
     public class Bridge {
@@ -85,6 +102,7 @@ public class MainActivity extends Activity {
                 o.put("total", prefs.getLong("blocked_total", 0));
                 o.put("today", todayCount);
                 o.put("trackers", prefs.getBoolean("trackers", true));
+                o.put("secureDnsBlock", prefs.getBoolean("block_secure_dns", true));
                 o.put("dns", prefs.getString("dns", "1.1.1.1"));
                 o.put("listCount", prefs.getInt("external_count", 0));
                 o.put("listUpdated", prefs.getString("external_updated", "Nunca"));
@@ -128,6 +146,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setTrackers(boolean enabled) {
             prefs.edit().putBoolean("trackers", enabled).apply();
+        }
+
+        @JavascriptInterface
+        public void setSecureDnsBlock(boolean enabled) {
+            prefs.edit().putBoolean("block_secure_dns", enabled).apply();
         }
 
         @JavascriptInterface
@@ -198,64 +221,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void updateList() {
-            prefs.edit().putString("list_status", "Baixando lista...").apply();
-            new Thread(() -> {
-                HttpURLConnection connection = null;
-                File temp = new File(getFilesDir(), "blocklist.tmp");
-                File dest = new File(getFilesDir(), "blocklist.txt");
-                int count = 0;
-                try {
-                    URL url = new URL(LIST_URL);
-                    connection = (HttpURLConnection) url.openConnection();
-                    connection.setConnectTimeout(12000);
-                    connection.setReadTimeout(20000);
-                    connection.setRequestProperty("User-Agent", "KauaAdBlock/1.0");
-                    connection.connect();
-                    if (connection.getResponseCode() != 200) throw new Exception("HTTP " + connection.getResponseCode());
-
-                    try (BufferedReader br = new BufferedReader(new InputStreamReader(new BufferedInputStream(connection.getInputStream())));
-                         FileOutputStream out = new FileOutputStream(temp)) {
-                        String line;
-                        StringBuilder buffer = new StringBuilder(65536);
-                        while ((line = br.readLine()) != null) {
-                            line = line.trim();
-                            if (line.isEmpty() || line.startsWith("#")) continue;
-                            String[] parts = line.split("\\s+");
-                            if (parts.length < 2) continue;
-                            String host = normalizeDomain(parts[1]);
-                            if (host.isEmpty() || "localhost".equals(host) || host.endsWith(".local")) continue;
-                            buffer.append(host).append('\n');
-                            count++;
-                            if (buffer.length() > 60000) {
-                                out.write(buffer.toString().getBytes("UTF-8"));
-                                buffer.setLength(0);
-                            }
-                        }
-                        if (buffer.length() > 0) out.write(buffer.toString().getBytes("UTF-8"));
-                    }
-
-                    if (dest.exists() && !dest.delete()) throw new Exception("Não foi possível substituir a lista antiga");
-                    if (!temp.renameTo(dest)) throw new Exception("Não foi possível salvar a nova lista");
-
-                    String stamp = new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(new Date());
-                    prefs.edit()
-                        .putInt("external_count", count)
-                        .putString("external_updated", stamp)
-                        .putString("list_status", "Lista atualizada")
-                        .apply();
-
-                    if (AdBlockVpnService.running) {
-                        Intent reload = new Intent(MainActivity.this, AdBlockVpnService.class);
-                        reload.setAction(AdBlockVpnService.ACTION_RELOAD);
-                        startService(reload);
-                    }
-                } catch (Exception e) {
-                    if (temp.exists()) temp.delete();
-                    prefs.edit().putString("list_status", "Falha: " + e.getMessage()).apply();
-                } finally {
-                    if (connection != null) connection.disconnect();
-                }
-            }, "filter-update").start();
+            downloadFilterLists(true);
         }
 
         private String setAsJson(String key) {
@@ -263,6 +229,137 @@ public class MainActivity extends Activity {
             for (String s : readSet(key)) a.put(s);
             return a.toString();
         }
+    }
+
+    private void maybeAutoUpdateList() {
+        File dest = new File(getFilesDir(), "blocklist.txt");
+        long last = prefs.getLong("external_updated_ms", 0L);
+        int count = prefs.getInt("external_count", 0);
+        long age = System.currentTimeMillis() - last;
+        if (!dest.exists() || count < 1000 || last <= 0L || age >= AUTO_UPDATE_INTERVAL_MS) {
+            downloadFilterLists(false);
+        }
+    }
+
+    private void downloadFilterLists(boolean manual) {
+        if (listDownloadRunning) {
+            if (manual) prefs.edit().putString("list_status", "Atualização já em andamento...").apply();
+            return;
+        }
+        listDownloadRunning = true;
+        prefs.edit().putString("list_status", manual ? "Baixando lista ampliada..." : "Preparando proteção ampliada...").apply();
+
+        new Thread(() -> {
+            File temp = new File(getFilesDir(), "blocklist.tmp");
+            File dest = new File(getFilesDir(), "blocklist.txt");
+            LinkedHashSet<String> domains = new LinkedHashSet<>(120000);
+            int successfulSources = 0;
+            String lastError = "";
+
+            try {
+                for (String source : LIST_URLS) {
+                    HttpURLConnection connection = null;
+                    try {
+                        URL url = new URL(source);
+                        connection = (HttpURLConnection) url.openConnection();
+                        connection.setConnectTimeout(12000);
+                        connection.setReadTimeout(25000);
+                        connection.setRequestProperty("User-Agent", "KauaAdBlock/2.0");
+                        connection.setInstanceFollowRedirects(true);
+                        connection.connect();
+                        int code = connection.getResponseCode();
+                        if (code < 200 || code >= 300) throw new Exception("HTTP " + code);
+
+                        try (BufferedReader br = new BufferedReader(new InputStreamReader(new BufferedInputStream(connection.getInputStream())))) {
+                            String line;
+                            while ((line = br.readLine()) != null) {
+                                addHostsFromLine(domains, line);
+                                if (domains.size() >= 250000) break;
+                            }
+                        }
+                        successfulSources++;
+                    } catch (Exception sourceError) {
+                        lastError = sourceError.getMessage() == null ? sourceError.getClass().getSimpleName() : sourceError.getMessage();
+                    } finally {
+                        if (connection != null) connection.disconnect();
+                    }
+                }
+
+                if (successfulSources == 0 || domains.size() < 1000) {
+                    throw new Exception(lastError.isEmpty() ? "nenhuma fonte respondeu" : lastError);
+                }
+
+                try (FileOutputStream out = new FileOutputStream(temp)) {
+                    StringBuilder buffer = new StringBuilder(65536);
+                    for (String host : domains) {
+                        buffer.append(host).append('\n');
+                        if (buffer.length() >= 60000) {
+                            out.write(buffer.toString().getBytes("UTF-8"));
+                            buffer.setLength(0);
+                        }
+                    }
+                    if (buffer.length() > 0) out.write(buffer.toString().getBytes("UTF-8"));
+                }
+
+                if (dest.exists() && !dest.delete()) throw new Exception("não foi possível substituir a lista antiga");
+                if (!temp.renameTo(dest)) throw new Exception("não foi possível salvar a nova lista");
+
+                long now = System.currentTimeMillis();
+                String stamp = new SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(new Date(now));
+                prefs.edit()
+                    .putInt("external_count", domains.size())
+                    .putLong("external_updated_ms", now)
+                    .putString("external_updated", stamp)
+                    .putString("list_status", "Proteção ampliada ativa • " + domains.size() + " domínios")
+                    .apply();
+
+                if (AdBlockVpnService.running) {
+                    Intent reload = new Intent(MainActivity.this, AdBlockVpnService.class);
+                    reload.setAction(AdBlockVpnService.ACTION_RELOAD);
+                    startService(reload);
+                }
+            } catch (Exception e) {
+                if (temp.exists()) temp.delete();
+                boolean hasOld = dest.exists() && prefs.getInt("external_count", 0) >= 1000;
+                String msg = hasOld
+                    ? "Não atualizou agora; mantendo a lista anterior"
+                    : "Falha ao ampliar filtros: " + (e.getMessage() == null ? "erro de rede" : e.getMessage());
+                prefs.edit().putString("list_status", msg).apply();
+            } finally {
+                listDownloadRunning = false;
+            }
+        }, "filter-update-v2").start();
+    }
+
+    private static void addHostsFromLine(Set<String> domains, String line) {
+        if (line == null) return;
+        line = line.trim();
+        if (line.isEmpty() || line.startsWith("#")) return;
+
+        int hash = line.indexOf('#');
+        if (hash >= 0) line = line.substring(0, hash).trim();
+        if (line.isEmpty()) return;
+
+        String[] parts = line.split("\\s+");
+        if (parts.length == 1) {
+            String host = normalizeDomain(parts[0]);
+            if (isUsableHost(host)) domains.add(host);
+            return;
+        }
+
+        // Em listas hosts o primeiro campo costuma ser 0.0.0.0/127.0.0.1 e os demais são domínios.
+        for (int i = 1; i < parts.length; i++) {
+            String host = normalizeDomain(parts[i]);
+            if (isUsableHost(host)) domains.add(host);
+        }
+    }
+
+    private static boolean isUsableHost(String host) {
+        return !host.isEmpty()
+            && !"localhost".equals(host)
+            && !host.endsWith(".local")
+            && !host.equals("broadcasthost")
+            && !host.matches("^[0-9.]+$");
     }
 
     private void startVpnService() {
