@@ -1,0 +1,133 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar projeto
+        uses: actions/checkout@v4
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar Android 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      # Ajuda a manter a mesma assinatura de teste entre builds.
+      - name: Restaurar chave de assinatura
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: adblock-debug-keystore-v1
+
+      - name: Criar projeto Android
+        run: |
+          mkdir -p app/src/main/java/com/kaua/adblock
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
+
+          cp index.html app/src/main/assets/index.html
+          cp MainActivity.java app/src/main/java/com/kaua/adblock/MainActivity.java
+          cp AdBlockVpnService.java app/src/main/java/com/kaua/adblock/AdBlockVpnService.java
+          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+          cp icone.png app/src/main/res/drawable/icone.png
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "BloqueadorAnuncios"
+          include ":app"
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.7.3" apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.kaua.adblock"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.kaua.adblock"
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:statusBarColor">#667EEA</item>
+                  <item name="android:navigationBarColor">#0B1020</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          EOF
+
+      - name: Compilar APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Preparar APK
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             Bloqueador-de-Anuncios-V1.0.apk
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bloqueador-de-Anuncios-V1.0
+          path: Bloqueador-de-Anuncios-V1.0.apk
