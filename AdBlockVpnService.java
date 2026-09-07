@@ -26,11 +26,14 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.Set;
 
 public class AdBlockVpnService extends VpnService {
     public static final String ACTION_STOP = "com.kaua.adblock.STOP";
     public static final String ACTION_RELOAD = "com.kaua.adblock.RELOAD";
+    public static final String ACTION_RESTART = "com.kaua.adblock.RESTART";
     public static volatile boolean running = false;
 
     private static final String PREFS = "adblock_prefs";
@@ -42,6 +45,8 @@ public class AdBlockVpnService extends VpnService {
     private volatile boolean stopping;
     private SharedPreferences prefs;
     private volatile Set<String> externalList = Collections.emptySet();
+    private final Map<String, Long> lastCountedAt = new HashMap<>();
+    private static final long COUNT_COOLDOWN_MS = 60_000L;
 
     // Redes de anúncios mais comuns em apps Android. Evitamos raízes muito amplas que
     // poderiam quebrar serviços legítimos do mesmo provedor.
@@ -78,6 +83,24 @@ public class AdBlockVpnService extends VpnService {
         "dns.nextdns.io", "dns.adguard-dns.com", "doh.cleanbrowsing.org", "dns0.eu"
     ));
 
+    // Resolvers públicos usados com frequência por apps que tentam ignorar o DNS do Android.
+    // Quando a proteção reforçada está ativa, estes IPs entram no túnel. UDP/53 continua
+    // sendo filtrado normalmente; DoT (853) e DoH/HTTP3 (443) são descartados, forçando
+    // o app a voltar para o resolvedor do sistema quando ele oferece fallback.
+    private static final String[] SECURE_DNS_IPV4 = new String[]{
+        "1.1.1.1", "1.0.0.1",
+        "8.8.8.8", "8.8.4.4",
+        "9.9.9.9", "149.112.112.112",
+        "208.67.222.222", "208.67.220.220",
+        "94.140.14.14", "94.140.15.15"
+    };
+
+    private static final String[] SECURE_DNS_IPV6 = new String[]{
+        "2606:4700:4700::1111", "2606:4700:4700::1001",
+        "2001:4860:4860::8888", "2001:4860:4860::8844",
+        "2620:fe::fe", "2620:fe::9"
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -96,6 +119,12 @@ public class AdBlockVpnService extends VpnService {
         }
         if (ACTION_RELOAD.equals(action)) {
             loadExternalList();
+            return START_STICKY;
+        }
+        if (ACTION_RESTART.equals(action)) {
+            stopVpn();
+            startAsForeground();
+            startVpn();
             return START_STICKY;
         }
 
@@ -129,7 +158,7 @@ public class AdBlockVpnService extends VpnService {
         return new Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_secure)
             .setContentTitle("Bloqueador de anúncios ativo")
-            .setContentText(blocked + " bloqueios hoje")
+            .setContentText(blocked + " consultas DNS bloqueadas hoje")
             .setContentIntent(openPi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -146,8 +175,17 @@ public class AdBlockVpnService extends VpnService {
                 .setMtu(1500)
                 .addAddress("10.10.10.1", 32)
                 .addDnsServer("10.10.10.2")
-                .addRoute("10.10.10.2", 32)
-                .setBlocking(true);
+                .addRoute("10.10.10.2", 32);
+
+            if (prefs.getBoolean("block_secure_dns", true)) {
+                for (String ip : SECURE_DNS_IPV4) builder.addRoute(ip, 32);
+                try {
+                    builder.addAddress("fd00:1:fd00:1::1", 128);
+                    for (String ip : SECURE_DNS_IPV6) builder.addRoute(ip, 128);
+                } catch (Exception ignored) { }
+            }
+
+            builder.setBlocking(true);
 
             Intent configure = new Intent(this, MainActivity.class);
             PendingIntent configPi = PendingIntent.getActivity(this, 10, configure,
@@ -421,6 +459,15 @@ public class AdBlockVpnService extends VpnService {
     }
 
     private void incrementStats(String domain) {
+        long now = System.currentTimeMillis();
+        Long previous = lastCountedAt.get(domain);
+        if (previous != null && now - previous < COUNT_COOLDOWN_MS) return;
+        lastCountedAt.put(domain, now);
+        if (lastCountedAt.size() > 512) {
+            long cutoff = now - (COUNT_COOLDOWN_MS * 5);
+            lastCountedAt.entrySet().removeIf(e -> e.getValue() < cutoff);
+        }
+
         String today = new SimpleDateFormat("yyyy-MM-dd", Locale.US).format(new Date());
         String stored = prefs.getString("stats_day", today);
         long todayCount = stored.equals(today) ? prefs.getLong("blocked_today", 0) : 0;

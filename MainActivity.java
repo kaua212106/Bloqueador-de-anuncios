@@ -151,6 +151,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void setSecureDnsBlock(boolean enabled) {
             prefs.edit().putBoolean("block_secure_dns", enabled).apply();
+            if (AdBlockVpnService.running) {
+                Intent i = new Intent(MainActivity.this, AdBlockVpnService.class);
+                i.setAction(AdBlockVpnService.ACTION_RESTART);
+                if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
+            }
         }
 
         @JavascriptInterface

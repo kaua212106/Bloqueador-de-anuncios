@@ -38,7 +38,7 @@ select{border:1px solid #e1e5ed;border-radius:12px;padding:10px 11px;background:
 <main>
 <section id="home" class="page active">
   <div class="hero-copy"><h2>Proteção do celular</h2><p>Bloqueie anúncios e rastreadores usando uma VPN local.</p></div>
-  <div class="dashboard"><div class="dash"><b id="today">0</b><small>Bloqueios hoje</small></div><div class="dash"><b id="total">0</b><small>Total bloqueado</small></div></div>
+  <div class="dashboard"><div class="dash"><b id="today">0</b><small>Consultas bloqueadas hoje</small></div><div class="dash"><b id="total">0</b><small>Total de consultas</small></div></div>
   <div id="hero" class="card protection-card">
     <div class="status-head"><div class="shield">🛡</div><div class="grow"><div id="status" class="status">Desativado</div><div id="statusSub" class="sub">Toque abaixo para iniciar a proteção</div></div></div>
     <button id="mainBtn" class="mainBtn" onclick="toggleProtection()">Ativar proteção</button>
@@ -48,6 +48,7 @@ select{border:1px solid #e1e5ed;border-radius:12px;padding:10px 11px;background:
   <div class="card">
     <div class="row"><div class="grow"><b>Lista ampliada</b><small><span id="listCount">0</span> domínios • <span id="listUpdated">Nunca</span></small></div><button class="secondary" onclick="updateList()">Atualizar</button></div>
     <div id="listStatus" class="note">A lista ampliada é opcional. O bloqueio básico funciona sem internet.</div>
+    <div class="note"><b>Sobre o contador:</b> ele mostra consultas DNS bloqueadas, não a quantidade de anúncios que apareceriam. Apps em segundo plano podem consultar e repetir domínios mesmo sem mostrar um anúncio.</div>
   </div>
 </section>
 
@@ -63,7 +64,7 @@ select{border:1px solid #e1e5ed;border-radius:12px;padding:10px 11px;background:
   <div class="hero-copy"><h2>Ajustes</h2><p>Configure a proteção e o comportamento do bloqueador.</p></div><div class="section-title"><h2>Proteção</h2></div>
   <div class="card">
     <div class="row" onclick="toggleTrackers()"><div class="grow"><b>Bloquear rastreadores</b><small>Analytics e rastreamento conhecidos</small></div><div id="trackerToggle" class="toggle"></div></div>
-    <div class="row" onclick="toggleSecureDns()"><div class="grow"><b>Evitar DNS privado dos apps</b><small>Dificulta que apps ignorem o filtro usando DNS-over-HTTPS</small></div><div id="secureDnsToggle" class="toggle"></div></div>
+    <div class="row" onclick="toggleSecureDns()"><div class="grow"><b>Bloqueio reforçado de DNS privado</b><small>Bloqueia resolvers conhecidos por hostname e IP; a VPN reinicia ao mudar</small></div><div id="secureDnsToggle" class="toggle"></div></div>
     <div class="row"><div class="grow"><b>DNS externo</b><small>Usado apenas para consultas permitidas</small></div><select id="dns" onchange="changeDns()"><option>1.1.1.1</option><option>8.8.8.8</option><option>9.9.9.9</option></select></div>
     <div class="row"><div class="grow"><b>VPN sempre ativa</b><small>Abra as configurações do Android para ativar</small></div><button class="secondary" onclick="AdBlock.openVpnSettings()">Abrir</button></div>
   </div>
@@ -90,7 +91,7 @@ function closeMenu(){document.getElementById('menuModal')?.classList.remove('sho
 function refresh(){state=parse(call('getState'),'{}')||{};document.getElementById('today').textContent=state.today||0;document.getElementById('total').textContent=state.total||0;document.getElementById('listCount').textContent=(state.listCount||0).toLocaleString('pt-BR');document.getElementById('listUpdated').textContent=state.listUpdated||'Nunca';if(state.listStatus)document.getElementById('listStatus').textContent=state.listStatus;document.getElementById('dns').value=state.dns||'1.1.1.1';document.getElementById('trackerToggle').classList.toggle('on',!!state.trackers);document.getElementById('secureDnsToggle').classList.toggle('on',state.secureDnsBlock!==false);let hero=document.getElementById('hero'),btn=document.getElementById('mainBtn');if(state.running){hero.classList.add('on');document.getElementById('status').textContent='Protegido';document.getElementById('statusSub').textContent='Bloqueio DNS ativo neste celular';btn.textContent='Desativar proteção';btn.classList.add('stop')}else{hero.classList.remove('on');document.getElementById('status').textContent='Desativado';document.getElementById('statusSub').textContent='Toque abaixo para iniciar a proteção';btn.textContent='Ativar proteção';btn.classList.remove('stop')}renderRecent()}
 function toggleProtection(){if(state.running)call('stop');else call('start');setTimeout(refresh,700)}
 function toggleTrackers(){let v=!state.trackers;call('setTrackers',v);state.trackers=v;document.getElementById('trackerToggle').classList.toggle('on',v)}
-function toggleSecureDns(){let v=state.secureDnsBlock===false;call('setSecureDnsBlock',v);state.secureDnsBlock=v;document.getElementById('secureDnsToggle').classList.toggle('on',v);toast(v?'Proteção contra DNS privado ativada':'Proteção contra DNS privado desativada')}
+function toggleSecureDns(){let v=state.secureDnsBlock===false;call('setSecureDnsBlock',v);state.secureDnsBlock=v;document.getElementById('secureDnsToggle').classList.toggle('on',v);toast(v?'Bloqueio reforçado ativado; reiniciando VPN':'Bloqueio reforçado desativado; reiniciando VPN')}
 function changeDns(){call('setDns',document.getElementById('dns').value);toast('DNS alterado')}
 function renderRecent(){let a=parse(call('getRecent'));let box=document.getElementById('recent');if(!a.length){box.innerHTML='<div class="empty">Nenhum bloqueio ainda</div>';return}box.innerHTML=a.map(x=>`<div class="domain"><span class="dot"></span><span>${esc(x)}</span></div>`).join('')}
 function renderLists(){let b=parse(call('getBlocked')),a=parse(call('getAllowed'));document.getElementById('blockedList').innerHTML=b.length?b.map(x=>`<div class="domain"><span class="dot"></span><span>${esc(x)}</span><button class="del" onclick="delDomain('block','${js(x)}')">✕</button></div>`).join(''):'<div class="empty">Nenhum domínio personalizado</div>';document.getElementById('allowList').innerHTML=a.length?a.map(x=>`<div class="domain allow"><span class="dot"></span><span>${esc(x)}</span><button class="del" onclick="delDomain('allow','${js(x)}')">✕</button></div>`).join(''):'<div class="empty">Nenhuma exceção</div>'}
