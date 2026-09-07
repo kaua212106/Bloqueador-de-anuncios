@@ -6,10 +6,13 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.Context;
+import android.net.ConnectivityManager;
 import android.content.pm.ServiceInfo;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
+import android.system.OsConstants;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -19,6 +22,7 @@ import java.io.FileReader;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Collections;
@@ -46,7 +50,10 @@ public class AdBlockVpnService extends VpnService {
     private SharedPreferences prefs;
     private volatile Set<String> externalList = Collections.emptySet();
     private final Map<String, Long> lastCountedAt = new HashMap<>();
+    private final Map<String, Long> lastLoggedAt = new HashMap<>();
+    private ConnectivityManager connectivityManager;
     private static final long COUNT_COOLDOWN_MS = 60_000L;
+    private static final long LOG_COOLDOWN_MS = 5_000L;
 
     // Redes de anúncios mais comuns em apps Android. Evitamos raízes muito amplas que
     // poderiam quebrar serviços legítimos do mesmo provedor.
@@ -105,6 +112,7 @@ public class AdBlockVpnService extends VpnService {
     public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        connectivityManager = (ConnectivityManager)getSystemService(Context.CONNECTIVITY_SERVICE);
         createNotificationChannel();
         loadExternalList();
     }
@@ -234,7 +242,7 @@ public class AdBlockVpnService extends VpnService {
             int ihl = (packet[0] & 0x0F) * 4;
             if (ihl < 20 || length < ihl + 8) return null;
             int protocol = packet[9] & 0xFF;
-            if (protocol != 17) return null; // consultas UDP/53 nesta implementação
+            if (protocol != 17) return null; // DNS UDP nesta versão
 
             int srcPort = u16(packet, ihl);
             int dstPort = u16(packet, ihl + 2);
@@ -248,19 +256,28 @@ public class AdBlockVpnService extends VpnService {
             String domain = parseDomain(dnsQuery);
             if (domain == null || domain.isEmpty()) return null;
 
+            String ownerPackage = resolveOwnerPackage(packet, srcPort, dstPort);
+            String reason = blockReason(domain);
             byte[] dnsResponse;
-            if (shouldBlock(domain)) {
+
+            if (reason != null) {
                 dnsResponse = nxdomain(dnsQuery);
                 incrementStats(domain);
+                logDnsActivity(domain, true, reason, ownerPackage);
             } else {
                 dnsResponse = forwardDns(dnsQuery);
-                if (dnsResponse == null) return null;
+                if (dnsResponse == null) {
+                    logDnsActivity(domain, false, "falha no DNS", ownerPackage);
+                    return null;
+                }
 
-                // V2: bloqueia também quando um domínio permitido apenas redireciona por CNAME/SVCB
-                // para uma rede que consta nos filtros (CNAME cloaking).
+                // Detecta camuflagem por CNAME/SVCB/HTTPS para um domínio da lista.
                 if (responsePointsToBlockedTarget(dnsResponse)) {
                     dnsResponse = nxdomain(dnsQuery);
                     incrementStats(domain);
+                    logDnsActivity(domain, true, "redirecionamento bloqueado", ownerPackage);
+                } else {
+                    logDnsActivity(domain, false, "permitido", ownerPackage);
                 }
             }
             return buildIpv4UdpResponse(packet, ihl, srcPort, dnsResponse);
@@ -269,17 +286,76 @@ public class AdBlockVpnService extends VpnService {
         }
     }
 
-    private boolean shouldBlock(String domain) {
+    private String blockReason(String domain) {
         domain = domain.toLowerCase(Locale.ROOT);
         Set<String> allowed = readSetPref("allowed");
-        if (matchesAny(domain, allowed)) return false;
+        if (matchesAny(domain, allowed)) return null;
 
         Set<String> custom = readSetPref("custom_blocked");
-        if (matchesAny(domain, custom)) return true;
-        if (matchesAny(domain, BUILTIN_ADS)) return true;
-        if (matchesAny(domain, externalList)) return true;
-        if (prefs.getBoolean("trackers", true) && matchesAny(domain, BUILTIN_TRACKERS)) return true;
-        return prefs.getBoolean("block_secure_dns", true) && matchesAny(domain, SECURE_DNS_HOSTS);
+        if (matchesAny(domain, custom)) return "regra personalizada";
+        if (matchesAny(domain, BUILTIN_ADS)) return "rede de anúncios";
+        if (matchesAny(domain, externalList)) return "lista PRO";
+        if (prefs.getBoolean("trackers", true) && matchesAny(domain, BUILTIN_TRACKERS)) return "rastreador";
+        if (prefs.getBoolean("block_secure_dns", true) && matchesAny(domain, SECURE_DNS_HOSTS)) return "DNS privado";
+        return null;
+    }
+
+    private String resolveOwnerPackage(byte[] packet, int srcPort, int dstPort) {
+        if (Build.VERSION.SDK_INT < 29 || connectivityManager == null) return "";
+        try {
+            InetAddress local = InetAddress.getByAddress(Arrays.copyOfRange(packet, 12, 16));
+            InetAddress remote = InetAddress.getByAddress(Arrays.copyOfRange(packet, 16, 20));
+            int uid = connectivityManager.getConnectionOwnerUid(
+                OsConstants.IPPROTO_UDP,
+                new InetSocketAddress(local, srcPort),
+                new InetSocketAddress(remote, dstPort)
+            );
+            if (uid < 0) return "";
+            String[] packages = getPackageManager().getPackagesForUid(uid);
+            if (packages == null || packages.length == 0) return "";
+            return packages[0] == null ? "" : packages[0];
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private void logDnsActivity(String domain, boolean blocked, String reason, String ownerPackage) {
+        if (!prefs.getBoolean("diagnostic_enabled", true)) return;
+        long now = System.currentTimeMillis();
+        String pkg = ownerPackage == null ? "" : ownerPackage.replace('	', ' ').replace('
+', ' ');
+        String cleanReason = reason == null ? "" : reason.replace('	', ' ').replace('
+', ' ');
+        String key = (blocked ? "B" : "A") + "|" + pkg + "|" + domain;
+        Long previous = lastLoggedAt.get(key);
+        if (previous != null && now - previous < LOG_COOLDOWN_MS) return;
+        lastLoggedAt.put(key, now);
+        if (lastLoggedAt.size() > 600) {
+            long cutoff = now - 60_000L;
+            lastLoggedAt.entrySet().removeIf(e -> e.getValue() < cutoff);
+        }
+
+        StringBuilder b = new StringBuilder();
+        b.append(now).append('	')
+            .append(blocked ? 'B' : 'A').append('	')
+            .append(pkg).append('	')
+            .append(cleanReason).append('	')
+            .append(domain).append('
+');
+
+        String old = prefs.getString("dns_activity", "");
+        int kept = 0;
+        for (String line : old.split("\n")) {
+            if (line.trim().isEmpty()) continue;
+            b.append(line).append('
+');
+            if (++kept >= 119) break;
+        }
+        prefs.edit().putString("dns_activity", b.toString()).apply();
+    }
+
+    private boolean shouldBlock(String domain) {
+        return blockReason(domain) != null;
     }
 
     private boolean matchesAny(String domain, Set<String> set) {

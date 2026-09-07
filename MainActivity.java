@@ -42,6 +42,8 @@ public class MainActivity extends Activity {
 
     // Duas fontes em formato hosts. Se uma falhar, a outra ainda pode atualizar a proteção.
     private static final String[] LIST_URLS = new String[]{
+        // HaGeZi Multi PRO: lista equilibrada e bem mais ampla para anúncios móveis.
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/pro.txt",
         "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
         "https://adaway.org/hosts.txt"
     };
@@ -60,6 +62,7 @@ public class MainActivity extends Activity {
         if (!prefs.contains("trackers")) prefs.edit().putBoolean("trackers", true).apply();
         if (!prefs.contains("dns")) prefs.edit().putString("dns", "1.1.1.1").apply();
         if (!prefs.contains("block_secure_dns")) prefs.edit().putBoolean("block_secure_dns", true).apply();
+        if (!prefs.contains("diagnostic_enabled")) prefs.edit().putBoolean("diagnostic_enabled", true).apply();
 
         webView = new WebView(this);
         webView.setBackgroundColor(Color.rgb(102, 126, 234));
@@ -103,6 +106,7 @@ public class MainActivity extends Activity {
                 o.put("today", todayCount);
                 o.put("trackers", prefs.getBoolean("trackers", true));
                 o.put("secureDnsBlock", prefs.getBoolean("block_secure_dns", true));
+                o.put("diagnostic", prefs.getBoolean("diagnostic_enabled", true));
                 o.put("dns", prefs.getString("dns", "1.1.1.1"));
                 o.put("listCount", prefs.getInt("external_count", 0));
                 o.put("listUpdated", prefs.getString("external_updated", "Nunca"));
@@ -156,6 +160,41 @@ public class MainActivity extends Activity {
                 i.setAction(AdBlockVpnService.ACTION_RESTART);
                 if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
             }
+        }
+
+        @JavascriptInterface
+        public void setDiagnostic(boolean enabled) {
+            prefs.edit().putBoolean("diagnostic_enabled", enabled).apply();
+        }
+
+        @JavascriptInterface
+        public void clearDnsActivity() {
+            prefs.edit().putString("dns_activity", "").apply();
+        }
+
+        @JavascriptInterface
+        public String getDnsActivity() {
+            JSONArray out = new JSONArray();
+            String raw = prefs.getString("dns_activity", "");
+            for (String line : raw.split("\n")) {
+                if (line.trim().isEmpty()) continue;
+                String[] parts = line.split("\t", 5);
+                if (parts.length < 5) continue;
+                try {
+                    JSONObject o = new JSONObject();
+                    long ts = Long.parseLong(parts[0]);
+                    String pkg = parts[2];
+                    o.put("time", new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date(ts)));
+                    o.put("blocked", "B".equals(parts[1]));
+                    o.put("package", pkg);
+                    o.put("app", appLabel(pkg));
+                    o.put("reason", parts[3]);
+                    o.put("domain", parts[4]);
+                    out.put(o);
+                } catch (Exception ignored) { }
+                if (out.length() >= 120) break;
+            }
+            return out.toString();
         }
 
         @JavascriptInterface
@@ -229,6 +268,16 @@ public class MainActivity extends Activity {
             downloadFilterLists(true);
         }
 
+        private String appLabel(String pkg) {
+            if (pkg == null || pkg.trim().isEmpty()) return "App não identificado";
+            try {
+                PackageManager pm = getPackageManager();
+                return pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+            } catch (Exception e) {
+                return pkg;
+            }
+        }
+
         private String setAsJson(String key) {
             JSONArray a = new JSONArray();
             for (String s : readSet(key)) a.put(s);
@@ -241,7 +290,8 @@ public class MainActivity extends Activity {
         long last = prefs.getLong("external_updated_ms", 0L);
         int count = prefs.getInt("external_count", 0);
         long age = System.currentTimeMillis() - last;
-        if (!dest.exists() || count < 1000 || last <= 0L || age >= AUTO_UPDATE_INTERVAL_MS) {
+        int schema = prefs.getInt("filter_schema", 0);
+        if (!dest.exists() || count < 1000 || last <= 0L || age >= AUTO_UPDATE_INTERVAL_MS || schema < 3) {
             downloadFilterLists(false);
         }
     }
@@ -279,7 +329,7 @@ public class MainActivity extends Activity {
                             String line;
                             while ((line = br.readLine()) != null) {
                                 addHostsFromLine(domains, line);
-                                if (domains.size() >= 250000) break;
+                                if (domains.size() >= 350000) break;
                             }
                         }
                         successfulSources++;
@@ -315,7 +365,8 @@ public class MainActivity extends Activity {
                     .putInt("external_count", domains.size())
                     .putLong("external_updated_ms", now)
                     .putString("external_updated", stamp)
-                    .putString("list_status", "Proteção ampliada ativa • " + domains.size() + " domínios")
+                    .putInt("filter_schema", 3)
+                    .putString("list_status", "Proteção ampliada PRO ativa • " + domains.size() + " domínios")
                     .apply();
 
                 if (AdBlockVpnService.running) {
