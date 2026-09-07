@@ -322,10 +322,8 @@ public class AdBlockVpnService extends VpnService {
     private void logDnsActivity(String domain, boolean blocked, String reason, String ownerPackage) {
         if (!prefs.getBoolean("diagnostic_enabled", true)) return;
         long now = System.currentTimeMillis();
-        String pkg = ownerPackage == null ? "" : ownerPackage.replace('	', ' ').replace('
-', ' ');
-        String cleanReason = reason == null ? "" : reason.replace('	', ' ').replace('
-', ' ');
+        String pkg = ownerPackage == null ? "" : ownerPackage.replace('\t', ' ').replace('\n', ' ');
+        String cleanReason = reason == null ? "" : reason.replace('\t', ' ').replace('\n', ' ');
         String key = (blocked ? "B" : "A") + "|" + pkg + "|" + domain;
         Long previous = lastLoggedAt.get(key);
         if (previous != null && now - previous < LOG_COOLDOWN_MS) return;
@@ -340,15 +338,13 @@ public class AdBlockVpnService extends VpnService {
             .append(blocked ? 'B' : 'A').append('	')
             .append(pkg).append('	')
             .append(cleanReason).append('	')
-            .append(domain).append('
-');
+            .append(domain).append('\n');
 
         String old = prefs.getString("dns_activity", "");
         int kept = 0;
         for (String line : old.split("\n")) {
             if (line.trim().isEmpty()) continue;
-            b.append(line).append('
-');
+            b.append(line).append('\n');
             if (++kept >= 119) break;
         }
         prefs.edit().putString("dns_activity", b.toString()).apply();
